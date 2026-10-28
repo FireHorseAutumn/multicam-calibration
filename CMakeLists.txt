@@ -30,18 +30,35 @@ add_library(mcc_core STATIC
     src/pose_init.cpp
     src/bundle_adjustment.cpp
     src/colmap_export.cpp
+    src/batched_solve.cu
 )
 target_include_directories(mcc_core PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
 )
-target_link_libraries(mcc_core PUBLIC Eigen3::Eigen)
+target_link_libraries(mcc_core PUBLIC Eigen3::Eigen PRIVATE CUDA::cudart)
 
-# STANDALONE: vendor a copy of btl/cholesky.cuh into include/mcc/vendor/
-# (see README "Vendored headers"). Never include from a sibling repo.
+# STANDALONE: btl/cholesky.cuh is vendored into include/mcc/vendor/btl/
+# (see VENDORING.md). Never include from a sibling repo.
 
-# TODO: add targets as sources land
 add_executable(test_synthetic_e2e tests/test_synthetic_e2e.cpp)
 target_link_libraries(test_synthetic_e2e PRIVATE mcc_core)
 
+add_executable(test_detector tests/test_detector.cpp)
+target_link_libraries(test_detector PRIVATE mcc_core)
+target_include_directories(test_detector PRIVATE tests)
+
+add_executable(test_colmap_export tests/test_colmap_export.cpp)
+target_link_libraries(test_colmap_export PRIVATE mcc_core)
+target_include_directories(test_colmap_export PRIVATE tests)
+
+add_executable(test_ba_gpu_solve tests/test_ba_gpu_solve.cpp)
+target_link_libraries(test_ba_gpu_solve PRIVATE mcc_core)
+
+add_executable(bench_solve_ab benchmarks/bench_solve_ab.cpp)
+target_link_libraries(bench_solve_ab PRIVATE mcc_core)
+
 enable_testing()
 add_test(NAME synthetic_e2e COMMAND test_synthetic_e2e)
+add_test(NAME detector COMMAND test_detector)
+add_test(NAME colmap_export COMMAND test_colmap_export)
+add_test(NAME ba_gpu_solve COMMAND test_ba_gpu_solve)

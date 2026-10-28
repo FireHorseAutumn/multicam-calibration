@@ -46,6 +46,32 @@ std::vector<uint8_t> adaptiveThreshold(const uint8_t* gray, int w, int h, int st
   return bin;
 }
 
+// 1 px, 8-neighborhood foreground erosion. On a contiguous ChArUco board the
+// anti-aliased pixels at square junctions classify dark whenever the local
+// mean is high enough, and the border tracer below is 8-connected: two black
+// squares whose corners remain king-move adjacent after binarization are
+// traced as one blob. 8-neighborhood erosion guarantees distinct
+// 4-connected components are no longer 8-adjacent (a diagonal-only bridge
+// pixel always has a background orthogonal neighbor), so each square traces
+// separately. The eroded corner pixel is recovered afterwards by the
+// sub-pixel refinement on the grayscale image.
+void erodeForeground(std::vector<uint8_t>& bin, int w, int h) {
+  std::vector<uint8_t> out(w * h, 0);
+  for (int y = 0; y < h; ++y)
+    for (int x = 0; x < w; ++x) {
+      if (!bin[y * w + x]) continue;
+      bool keep = true;
+      for (int dy = -1; dy <= 1 && keep; ++dy)
+        for (int dx = -1; dx <= 1 && keep; ++dx) {
+          if (dx == 0 && dy == 0) continue;
+          const int nx = x + dx, ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= w || ny >= h || !bin[ny * w + nx]) keep = false;
+        }
+      out[y * w + x] = keep ? 1 : 0;
+    }
+  bin = std::move(out);
+}
+
 // Clockwise 8-neighborhood offsets in image coords (y down), starting at NW.
 constexpr int kNb[8][2] = {{-1, -1}, {0, -1}, {1, -1}, {1, 0},
                            {1, 1},   {0, 1},  {-1, 1}, {-1, 0}};
@@ -131,6 +157,41 @@ std::vector<std::vector<Eigen::Vector2d>> outerContours(const std::vector<uint8_
   return contours;
 }
 
+// Andrew monotone chain; returns the hull in CCW order, collinear points
+// kept (they are the line-fit data for snapQuadCorners). Junction notches
+// left in a contour by threshold/erosion corner artifacts are concave and
+// drop out here; Douglas-Peucker on the raw contour would trip over them
+// (a ~20 px notch exceeds polygonal_epsilon and adds spurious vertices).
+std::vector<Eigen::Vector2d> convexHull(const std::vector<Eigen::Vector2d>& pts) {
+  std::vector<Eigen::Vector2d> p = pts;
+  std::sort(p.begin(), p.end(), [](const Eigen::Vector2d& a, const Eigen::Vector2d& b) {
+    return a.x() < b.x() || (a.x() == b.x() && a.y() < b.y());
+  });
+  p.erase(std::unique(p.begin(), p.end(),
+                      [](const Eigen::Vector2d& a, const Eigen::Vector2d& b) {
+                        return a.x() == b.x() && a.y() == b.y();
+                      }),
+          p.end());
+  if (p.size() <= 2) return p;
+  auto cross = [](const Eigen::Vector2d& o, const Eigen::Vector2d& a,
+                  const Eigen::Vector2d& b) {
+    return (a.x() - o.x()) * (b.y() - o.y()) - (a.y() - o.y()) * (b.x() - o.x());
+  };
+  std::vector<Eigen::Vector2d> lo, hi;
+  for (const auto& pt : p) {
+    while (lo.size() >= 2 && cross(lo[lo.size() - 2], lo.back(), pt) < 0.0) lo.pop_back();
+    lo.push_back(pt);
+  }
+  for (auto it = p.rbegin(); it != p.rend(); ++it) {
+    while (hi.size() >= 2 && cross(hi[hi.size() - 2], hi.back(), *it) < 0.0) hi.pop_back();
+    hi.push_back(*it);
+  }
+  lo.pop_back();
+  hi.pop_back();
+  lo.insert(lo.end(), hi.begin(), hi.end());
+  return lo;
+}
+
 double pointLineDistance(const Eigen::Vector2d& p, const Eigen::Vector2d& a,
                          const Eigen::Vector2d& b) {
   const Eigen::Vector2d ab = b - a;
@@ -156,38 +217,54 @@ void dpRecurse(const std::vector<Eigen::Vector2d>& pts, int a, int b, double eps
   dpRecurse(pts, imax, b, eps, keep);
 }
 
+// Closed-curve Douglas-Peucker. Anchors on the contour's diameter pair
+// (opposite extremes): anchoring on cont[0] would keep an arbitrary
+// mid-side trace-start point as a spurious vertex. Returned indices refer
+// to the input order.
 std::vector<Eigen::Vector2d> approxPolygon(const std::vector<Eigen::Vector2d>& cont,
-                                           double eps) {
+                                           double eps, std::vector<int>* idx_out) {
   const int n = static_cast<int>(cont.size());
-  if (n < 3) return cont;
-  std::vector<Eigen::Vector2d> ext = cont;
-  ext.push_back(cont[0]);
-  int far = 0;
-  double dmax = -1.0;
-  for (int i = 1; i < n; ++i) {
-    const double d = (cont[i] - cont[0]).squaredNorm();
-    if (d > dmax) {
-      dmax = d;
-      far = i;
-    }
+  if (n < 3) {
+    if (idx_out)
+      for (int i = 0; i < n; ++i) idx_out->push_back(i);
+    return cont;
   }
-  std::vector<uint8_t> keep(n + 1, 0);
-  keep[0] = keep[far] = keep[n] = 1;
-  dpRecurse(ext, 0, far, eps, keep);
-  dpRecurse(ext, far, n, eps, keep);
+  int ai = 0, bi = 0;
+  double dmax = -1.0;
+  for (int i = 0; i < n; ++i)
+    for (int j = i + 1; j < n; ++j) {
+      const double d = (cont[i] - cont[j]).squaredNorm();
+      if (d > dmax) {
+        dmax = d;
+        ai = i;
+        bi = j;
+      }
+    }
+  std::vector<Eigen::Vector2d> ext(2 * n + 1);
+  for (int i = 0; i <= 2 * n; ++i) ext[i] = cont[(ai + i) % n];
+  const int brot = (bi - ai + n) % n;
+  std::vector<uint8_t> keep(2 * n + 1, 0);
+  keep[0] = keep[brot] = keep[brot + n] = 1;
+  dpRecurse(ext, 0, brot, eps, keep);
+  dpRecurse(ext, brot, brot + n, eps, keep);
   std::vector<Eigen::Vector2d> out;
   for (int i = 0; i < n; ++i)
-    if (keep[i]) out.push_back(ext[i]);
+    if (keep[i] || keep[i + n]) {
+      out.push_back(ext[i]);
+      if (idx_out) idx_out->push_back((ai + i) % n);
+    }
   return out;
 }
 
-double polygonPerimeter(const std::vector<Eigen::Vector2d>& p) {
+template <typename P>
+double polygonPerimeter(const P& p) {
   double per = 0.0;
   for (size_t i = 0; i < p.size(); ++i) per += (p[(i + 1) % p.size()] - p[i]).norm();
   return per;
 }
 
-bool isConvexQuad(const std::vector<Eigen::Vector2d>& p) {
+template <typename P>
+bool isConvexQuad(const P& p) {
   int sign = 0;
   for (int i = 0; i < 4; ++i) {
     const Eigen::Vector2d e1 = p[(i + 1) & 3] - p[i];
@@ -203,9 +280,79 @@ bool isConvexQuad(const std::vector<Eigen::Vector2d>& p) {
   return true;
 }
 
+// Total-least-squares line fit: centroid + principal axis of the 2x2
+// covariance. Returns false for degenerate point sets.
+bool fitLine(const std::vector<Eigen::Vector2d>& pts, Eigen::Vector2d& point,
+             Eigen::Vector2d& dir) {
+  if (pts.size() < 2) return false;
+  Eigen::Vector2d mu = Eigen::Vector2d::Zero();
+  for (const auto& p : pts) mu += p;
+  mu /= static_cast<double>(pts.size());
+  double a = 0.0, b = 0.0, c = 0.0;
+  for (const auto& p : pts) {
+    const Eigen::Vector2d d = p - mu;
+    a += d.x() * d.x();
+    b += d.x() * d.y();
+    c += d.y() * d.y();
+  }
+  const double theta = 0.5 * std::atan2(2.0 * b, a - c);
+  dir = Eigen::Vector2d(std::cos(theta), std::sin(theta));
+  point = mu;
+  return dir.squaredNorm() > 0.5;
+}
+
+// Refine Douglas-Peucker quad vertices against the contour. DP guarantees
+// only a max-deviation bound, so its vertices can sit ~eps away from the
+// true corners (eps scales with perimeter) — the decode warp needs the
+// actual corners to keep the 6/8 cell alignment. Fit a line to each side
+// (end-trimmed to skip the rounded corner region) and intersect consecutive
+// side lines. Falls back to the DP vertex when a side is too short or the
+// lines are near-parallel.
+std::array<Eigen::Vector2d, 4> snapQuadCorners(const std::vector<Eigen::Vector2d>& cont,
+                                               const std::vector<int>& idx) {
+  const int n = static_cast<int>(cont.size());
+  Eigen::Vector2d lp[4], ld[4];
+  bool ok[4];
+  for (int k = 0; k < 4; ++k) {
+    const int a = idx[k], b = idx[(k + 1) & 3];
+    std::vector<Eigen::Vector2d> side;
+    for (int i = a;; i = (i + 1) % n) {
+      side.push_back(cont[i]);
+      if (i == b) break;
+    }
+    const int m = static_cast<int>(side.size());
+    if (m < 2) {
+      ok[k] = false;
+      continue;
+    }
+    const int trim = std::min(m / 4, (m - 2) / 2);
+    std::vector<Eigen::Vector2d> mid(side.begin() + trim, side.end() - trim);
+    ok[k] = fitLine(mid, lp[k], ld[k]);
+  }
+  std::array<Eigen::Vector2d, 4> out;
+  for (int k = 0; k < 4; ++k) {
+    const int prev = (k + 3) & 3;
+    if (ok[prev] && ok[k]) {
+      const double denom = ld[prev].x() * ld[k].y() - ld[prev].y() * ld[k].x();
+      if (std::abs(denom) > 1e-9) {
+        const Eigen::Vector2d d = lp[k] - lp[prev];
+        const double t = (d.x() * ld[k].y() - d.y() * ld[k].x()) / denom;
+        const Eigen::Vector2d p = lp[prev] + t * ld[prev];
+        if (p.allFinite()) {
+          out[k] = p;
+          continue;
+        }
+      }
+    }
+    out[k] = cont[idx[k]];  // fallback: DP vertex
+  }
+  return out;
+}
+
 // Angle-sort around the centroid (ascending atan2 in y-down image coords walks
 // TL, TR, BR, BL), then rotate so the corner with minimal x + y (top-left) leads.
-std::array<Eigen::Vector2d, 4> orderCorners(const std::vector<Eigen::Vector2d>& p) {
+template <typename P>
+std::array<Eigen::Vector2d, 4> orderCorners(const P& p) {
   Eigen::Vector2d c = Eigen::Vector2d::Zero();
   for (const auto& v : p) c += v;
   c /= 4.0;
@@ -341,8 +488,9 @@ DetectionResult CharucoDetector::detect(const uint8_t* gray, int width, int heig
 
   int window = cfg_.adaptive_window | 1;
   if (window < 3) window = 3;
-  const std::vector<uint8_t> bin =
+  std::vector<uint8_t> bin =
       adaptiveThreshold(gray, width, height, stride, window, cfg_.adaptive_offset);
+  erodeForeground(bin, width, height);
   const auto contours = outerContours(bin, width, height);
 
   std::vector<Quad> quads;
@@ -350,19 +498,32 @@ DetectionResult CharucoDetector::detect(const uint8_t* gray, int width, int heig
     if (cont.size() < 4) continue;
     const double per = polygonPerimeter(cont);
     if (per < cfg_.min_marker_perimeter || per > cfg_.max_marker_perimeter) continue;
-    const auto approx = approxPolygon(cont, cfg_.polygonal_epsilon * per);
+    const auto hull = convexHull(cont);
+    if (hull.size() < 4) continue;
+    std::vector<int> approx_idx;
+    const auto approx = approxPolygon(hull, cfg_.polygonal_epsilon * per, &approx_idx);
     if (approx.size() != 4 || !isConvexQuad(approx)) continue;
-    const double quad_per = polygonPerimeter(approx);
+    const std::array<Eigen::Vector2d, 4> corners = snapQuadCorners(hull, approx_idx);
+    if (!isConvexQuad(corners)) continue;
+    const double quad_per = polygonPerimeter(corners);
     if (quad_per < cfg_.min_marker_perimeter || quad_per > cfg_.max_marker_perimeter)
       continue;
     bool at_edge = false;
-    for (const auto& v : approx)
+    for (const auto& v : corners)
       if (v.x() < kBorderMargin || v.y() < kBorderMargin ||
           v.x() > width - 1 - kBorderMargin || v.y() > height - 1 - kBorderMargin)
         at_edge = true;
     if (at_edge) continue;
     Quad q;
-    q.corners = orderCorners(approx);
+    q.corners = orderCorners(corners);
+    // Refine the quad corners on the grayscale image before the warp: the
+    // binarized blob edge sits ~+-1-2 px off the true square edge (threshold
+    // asymmetry at junctions + erosion), and the decode grid assumes the
+    // quad IS the square outline to ~1/8 cell. cornerSubPix sees the
+    // threshold-independent intensity corner.
+    for (auto& c : q.corners)
+      c = refineCornerSubpix(gray, width, height, stride, c, cfg_.corner_refinement_window,
+                             cfg_.corner_refinement_iters);
     q.center = (q.corners[0] + q.corners[1] + q.corners[2] + q.corners[3]) / 4.0;
     bool duplicate = false;
     for (const auto& kept : quads)
@@ -392,6 +553,10 @@ DetectionResult CharucoDetector::detect(const uint8_t* gray, int width, int heig
       return s / ((u1 - u0) * (v1 - v0));
     };
 
+    // Border ring sampled at the central 50% of each ring cell: the margin
+    // band is exactly one canonical cell wide, so the ring check tolerates
+    // only ~+-2 px of quad error; the corner refinement before the warp is
+    // what brings the quad inside that budget.
     bool border_ok = true;
     for (int r = 0; r < cells && border_ok; ++r)
       for (int c = 0; c < cells; ++c)

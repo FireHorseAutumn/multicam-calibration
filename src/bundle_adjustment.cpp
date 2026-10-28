@@ -13,6 +13,8 @@
 #include <utility>
 #include <vector>
 
+#include "mcc/batched_solve.hpp"
+
 namespace mcc {
 
 namespace {
@@ -391,6 +393,64 @@ BAResult BundleAdjuster::run(const std::vector<CameraCache>& caches,
   int it = 0;
   bool converged = false;
 
+  bool use_btl = cfg_.board_solve == BoardSolveBackend::btl_gpu;
+  if (use_btl && !batchedSpdSolve6Available()) {
+    std::fprintf(stderr,
+                 "mcc BA: btl_gpu board solve requested but no CUDA device; "
+                 "using eigen\n");
+    use_btl = false;
+  }
+
+  // Damp, factor and solve every frame's 6x6 board block; fills
+  // X[s] = (B_s + lambda*diag)^-1 E_s^T (6 x L_s) and xg[s] = same * bg_s.
+  // Returns false if any block is not numerically SPD (btl reports per-system
+  // info; the eigen branch checks finiteness) — the caller raises lambda and
+  // retries, same as a failed reduced-system solve.
+  auto solve_board_blocks = [&](std::vector<Eigen::MatrixXd>& X,
+                                std::vector<Eigen::Matrix<double, 6, 1>>& xg) {
+    if (use_btl) {
+      // btl layout: full 6x6 row-major per system, one rhs per batch element
+      // (adapter expands); rhs columns of frame s are the rows of E[s],
+      // then bg[s].
+      std::vector<double> a(nframes * 36), rhs_flat;
+      std::vector<int> n_rhs(nframes);
+      for (int s = 0; s < nframes; ++s) {
+        Eigen::Matrix<double, 6, 6> Bd = B[s];
+        for (int j = 0; j < 6; ++j) Bd(j, j) += lambda * Df[s](j);
+        Eigen::Matrix<double, 6, 6> rm = Bd.transpose();  // to row-major
+        std::copy_n(rm.data(), 36, a.begin() + s * 36);
+        const int L = fblocks[s].L;
+        n_rhs[s] = L + 1;
+        for (int j = 0; j < L; ++j)
+          for (int k = 0; k < 6; ++k) rhs_flat.push_back(E[s](j, k));
+        for (int k = 0; k < 6; ++k) rhs_flat.push_back(bg[s](k));
+      }
+      std::vector<double> x_flat(rhs_flat.size());
+      if (!batchedSpdSolve6(a.data(), nframes, n_rhs.data(), rhs_flat.data(),
+                            x_flat.data()))
+        return false;
+      size_t off = 0;
+      for (int s = 0; s < nframes; ++s) {
+        const int L = fblocks[s].L;
+        X[s].resize(6, L);
+        for (int j = 0; j < L; ++j, off += 6)
+          for (int k = 0; k < 6; ++k) X[s](k, j) = x_flat[off + k];
+        for (int k = 0; k < 6; ++k) xg[s](k) = x_flat[off + k];
+        off += 6;
+      }
+      return true;
+    }
+    for (int s = 0; s < nframes; ++s) {
+      Eigen::Matrix<double, 6, 6> Bd = B[s];
+      for (int j = 0; j < 6; ++j) Bd(j, j) += lambda * Df[s](j);
+      const Eigen::LDLT<Eigen::Matrix<double, 6, 6>> ldlt(Bd);
+      X[s] = ldlt.solve(E[s].transpose());
+      xg[s] = ldlt.solve(bg[s]);
+      if (!X[s].allFinite() || !xg[s].allFinite()) return false;
+    }
+    return true;
+  };
+
   while (it < cfg_.max_iters && !converged) {
     accumulate();
     double ginf = kept_dim > 0 ? gb.cwiseAbs().maxCoeff() : 0.0;
@@ -410,29 +470,21 @@ BAResult BundleAdjuster::run(const std::vector<CameraCache>& caches,
       Eigen::VectorXd rhs = gb;
       std::vector<Eigen::MatrixXd> X(nframes);  // B^-1 E^T per frame
       std::vector<Eigen::Matrix<double, 6, 1>> xg(nframes);
-      bool ok = true;
-      for (int s = 0; s < nframes && ok; ++s) {
-        Eigen::Matrix<double, 6, 6> Bd = B[s];
-        for (int j = 0; j < 6; ++j) Bd(j, j) += lambda * Df[s](j);
-        const Eigen::LDLT<Eigen::Matrix<double, 6, 6>> ldlt(Bd);
-        X[s] = ldlt.solve(E[s].transpose());
-        xg[s] = ldlt.solve(bg[s]);
-        if (!X[s].allFinite() || !xg[s].allFinite()) {
-          ok = false;
-          break;
-        }
-        const auto& fb = fblocks[s];
-        for (size_t a = 0; a < fb.blocks.size(); ++a) {
-          const int ra = fb.local_row[a];
-          const auto [oa, sa] = fb.blocks[a];
-          rhs.segment(oa, sa) -= E[s].block(ra, 0, sa, 6) * xg[s];
-          for (size_t b = 0; b < fb.blocks.size(); ++b) {
-            const int rb = fb.local_row[b];
-            const auto [ob, sb] = fb.blocks[b];
-            S.block(oa, ob, sa, sb) -= E[s].block(ra, 0, sa, 6) * X[s].block(0, rb, 6, sb);
+      bool ok = solve_board_blocks(X, xg);
+      if (ok)
+        for (int s = 0; s < nframes; ++s) {
+          const auto& fb = fblocks[s];
+          for (size_t a = 0; a < fb.blocks.size(); ++a) {
+            const int ra = fb.local_row[a];
+            const auto [oa, sa] = fb.blocks[a];
+            rhs.segment(oa, sa) -= E[s].block(ra, 0, sa, 6) * xg[s];
+            for (size_t b = 0; b < fb.blocks.size(); ++b) {
+              const int rb = fb.local_row[b];
+              const auto [ob, sb] = fb.blocks[b];
+              S.block(oa, ob, sa, sb) -= E[s].block(ra, 0, sa, 6) * X[s].block(0, rb, 6, sb);
+            }
           }
         }
-      }
       Eigen::VectorXd dk = Eigen::VectorXd::Zero(kept_dim);
       if (ok && kept_dim > 0) {
         const Eigen::LDLT<Eigen::MatrixXd> sl(S);

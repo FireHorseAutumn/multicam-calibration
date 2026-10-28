@@ -68,8 +68,11 @@ struct CharucoBoard {
     return (sy * squares_x + sx) / 2;
   }
 
-  // The 4 board-frame corners of a marker (counter-clockwise, starting at
-  // the marker's top-left in its canonical orientation), used for decoding.
+  // The 4 board-frame corners of a marker's printed outline (the 6/8 inset
+  // quad; counter-clockwise, starting at the marker's top-left in its
+  // canonical orientation). Not used by the detector — its quad is the
+  // black-square outline (see detector.hpp) — but available to consumers
+  // that need the marker frame itself.
   void markerCorners(int marker_index, std::array<Eigen::Vector2d, 4>& out) const;
 };
 

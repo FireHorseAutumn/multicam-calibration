@@ -21,6 +21,12 @@
 
 namespace mcc {
 
+// Backend for the per-frame 6x6 board-block factor+solve inside the Schur
+// elimination. eigen: Eigen::LDLT on the CPU (default). btl_gpu: batched
+// Cholesky through the adapter in batched_solve.hpp (vendored btl kernels,
+// see VENDORING.md); falls back to eigen when no CUDA device is present.
+enum class BoardSolveBackend { eigen, btl_gpu };
+
 struct BAConfig {
   int max_iters = 50;
   double huber_delta = 1.0;      // pixels
@@ -28,6 +34,7 @@ struct BAConfig {
   double min_step_quality = 1e-3;// gain-ratio floor for accepting a step
   bool refine_intrinsics = false;
   bool verbose = false;
+  BoardSolveBackend board_solve = BoardSolveBackend::eigen;
 };
 
 struct BAResult {

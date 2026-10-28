@@ -1,11 +1,53 @@
 # multicam-calibration — decisions & novel-feature notes
 
-## Current status (Oct 17, 2026)
+## Current status (Oct 27, 2026)
 
-The Sep 29 "never compiled" statement below is historical. C1 later compiled
-and its noise-free synthetic numeric e2e test passed. The detector remains
-bypassed/unexercised, and COLMAP export and robustness paths remain unexercised.
-Next: board-image renderer -> detector test -> COLMAP smoke test.
+The Sep 29 "never compiled" statement below is historical. C1 compiled, the
+noise-free numeric e2e passed, and the detector is now exercised
+(`tests/test_detector.cpp` + `tests/board_renderer.hpp`, hand-written board
+renderer, Eigen only per decision 1): full recall on frontal, tilted, and
+close/steep synthetic views (27/27 markers, 40/40 corners, max corner error
+~0.9 px vs ground truth), clean rejection on blank/noise/occluded/
+garbled/frame-clipped inputs with zero false positives. Standard contiguous
+boards are supported (no printed seams needed). COLMAP export is
+covered by `tests/test_colmap_export.cpp` (parse-back round-trip, failure
+paths, k3-drop note). Next: input adapters -> JSON schema -> novel features.
+
+Two detector findings from first exercise, and the fixes:
+- The 8-connected contour tracer merged diagonally-touching black squares:
+  a contiguous board rendered undetectable (0–1 of 27 markers). Junction
+  anti-aliasing pixels classify dark when the local mean is high, and the
+  tracer is 8-connected, so king-move-adjacent squares become one blob.
+  FIXED: 1-px 8-neighborhood foreground erosion after the adaptive
+  threshold (distinct 4-connected components are then never 8-adjacent;
+  the eroded corner pixel is recovered by the grayscale sub-pixel
+  refinement). 27/27 on frontal and tilted contiguous boards. Renderer
+  supersampling went 2 -> 4: hard 1-px AA steps classify inconsistently at
+  junctions; real optics blur similarly.
+- FIXED: close/steep recall. Was: `polygonal_epsilon` (0.04 * perimeter)
+  gives Douglas-Peucker quad corners ~12 px of slack at close range,
+  breaking the exact 6/8 marker-inside-square cell alignment, and
+  threshold notches at junctions add spurious DP vertices (20/27 markers
+  at 0.45 m, 25 deg yaw pre-erosion; 19/27 with erosion alone). Fix, all
+  inside the quad stage: convex hull of the contour first (junction
+  notches are concave and drop out), DP anchored on the hull's diameter
+  pair (the old anchor kept the arbitrary trace-start point), quad
+  vertices snapped to the intersection of total-least-squares side line
+  fits, and a cornerSubPix pass on the grayscale image before the warp
+  (the binarized blob edge sits +-1-2 px off the true edge; the decode
+  grid needs the true outline). After: 27/27 at 0.45 m / 25 deg yaw;
+  max charuco corner error 0.9 px. Decision 8 intact: every rejection
+  path still explicit, zero false positives on noise.
+
+Same day, later: `btl/cholesky.cuh` vendored from batched-tiny-linalg
+(commit 3bb4194, provenance in VENDORING.md) behind the
+`include/mcc/batched_solve.hpp` adapter — first real dependency-graph edge.
+Wired into BA as `BoardSolveBackend::btl_gpu` (opt-in). The A/B
+(`benchmarks/bench_solve_ab.cpp`, table in README) is a LOSS at every tested
+scale (4.85x slower at the e2e rig's 14 systems, still 2.03x at 1024);
+Eigen LDLT remains the default. Correctness through the adapter is exact
+(ctest `ba_gpu_solve`). Revisit if frame counts grow by ~100x or the adapter
+moves the whole LM step to the GPU.
 
 ## Sep 29 decisions and historical state
 
