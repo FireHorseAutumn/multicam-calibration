@@ -3,11 +3,12 @@
 ## include/mcc/vendor/btl/cholesky.cuh
 
 - Source: sibling repo `batched-tiny-linalg`,
-  `include/btl/cholesky.cuh` at commit **3bb4194** (2026-10-22,
-  "Batched tiny Cholesky factor+solve (thread- and warp-per-matrix)").
+  `include/btl/cholesky.cuh` at commit **0f5672f** (2026-10-28, "Max-pass
+  fixes: ..." — comment-only; the corrected failure-semantics paragraph is
+  the content that matters).
 - Byte-identical copy; sha256
-  `f155c58c082f24abc3de6dbb5ffbc65ab869a2e27c393f8e6e7ffdc392d19d53`.
-- Vendored 2026-10-27. Header-only, no linking.
+  `c94afde6ef471fa0f18ce8fd675ea60c5e594919b9712705d4f34f36b5158ed3`.
+- Vendored 2026-10-27, refreshed 2026-10-28. Header-only, no linking.
 - C1 code includes the adapter `include/mcc/batched_solve.hpp`, never this
   header directly — the backend can be swapped or dropped without touching
   callers.
